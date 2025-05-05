@@ -1,0 +1,3 @@
+*.go linguist-language=Go
+*.thrift linguist-language=Go
+biz/model/ai/service/* linguist-generated=true

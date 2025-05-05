@@ -3,10 +3,16 @@
 package main
 
 import (
+	"os"
+
 	"github.com/cloudwego/hertz/pkg/app/server"
+	"github.com/cloudwego/hertz/pkg/common/hlog"
 )
 
-func main() {
+func main() {// 配置日志
+	hlog.SetLevel(hlog.LevelDebug)
+	// 设置日志输出到终端
+	hlog.SetOutput(os.Stdout)
 	h := server.Default()
 
 	register(h)

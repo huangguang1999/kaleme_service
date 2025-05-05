@@ -4,6 +4,9 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
+	"time"
 
 	service "kaleme/biz/model/ai/service"
 
@@ -33,7 +36,6 @@ func ProcessAIRequest(ctx context.Context, c *app.RequestContext) {
 // ProcessAIInfo .
 // @router /ai/info [POST]
 func ProcessAIInfo(ctx context.Context, c *app.RequestContext) {
-	hlog.Info("开始处理请求")
 	var req service.AIInfoRequest
 	err := c.BindAndValidate(&req)
 	if err != nil {
@@ -45,7 +47,7 @@ func ProcessAIInfo(ctx context.Context, c *app.RequestContext) {
 	client := openai.NewClient(
 		option.WithAPIKey("6ovtrsdgs1i9k5IX3WqFkV53qYbhkCmpJX688tZ4SmLn4ivDooNz9jLcCBH4TDvtx"),
 		option.WithBaseURL("https://api.stepfun.com/v1"),
-		option.WithRequestTimeout(60),
+		option.WithRequestTimeout(2*time.Minute),
 	)
 
 	// 创建聊天完成请求参数
@@ -58,7 +60,7 @@ func ProcessAIInfo(ctx context.Context, c *app.RequestContext) {
 		option.WithJSONSet("messages", []interface{}{
 			map[string]interface{}{
 				"role":    "system",
-				"content": "你是一位专业的美食识别与能量分析专家，能够依据用户提供的食物图片，精准判断其中美食的名称，并详细给出该美食的能量组成。",
+				"content": "你是一位专业的美食识别与能量分析专家，能够依据用户提供的食物图片，精准识别美食的名称，并测算出该美食的能量组成，从中提取食物名称、食物描述、食物卡路里（单位/kcal）、食物脂肪含量（单位/g）、食物蛋白质含量（单位/g）、食物碳水含量（单位/g），并以 JSON 的方式返回，只需要返回 JSON 数据，不需要任何解释，返回的数据不需要带单位。\n\n## 约束\n \n- 你会以下方的 JSON Schema 的格式返回给用户\n \n{\n    \"title\": \"用户食物解析\",\n    \"type\": \"object\",\n    \"properties\": {\n        \"name\": {\n            \"type\": \"string\",\n            \"description\": \"食物名称\"\n        },\n        \"description\": {\n            \"type\": \"string\",\n            \"description\": \"食物描述\"\n        },\n        \"calories\": {\n            \"type\": \"string\",\n            \"description\": \"食物卡路里（单位/kcal）\"\n        },\n        \"fat\": {\n            \"type\": \"string\",\n            \"description\": \"食物脂肪含量（单位/g）\"\n        },\n        \"protein\": {\n            \"type\": \"string\",\n            \"description\": \"食物蛋白质含量（单位/g）\"\n        },\n        \"car\": {\n            \"type\": \"string\",\n            \"description\": \"食物碳水含量（单位/g）\"\n        }\n    },\n    \"required\": [\n        \"name\",\n        \"description\",\n        \"calories\",\n        \"fat\",\n        \"protein\",\n        \"car\"\n    ]\n}",
 			},
 		}),
 	}
@@ -70,12 +72,8 @@ func ProcessAIInfo(ctx context.Context, c *app.RequestContext) {
 			"role": "user",
 			"content": []map[string]interface{}{
 				{
-					"type": "text",
-					"text": "输出图片中食物名字和能量",
-				},
-				{
-					"type": "ImageURL",
-					"ImageURL": map[string]string{
+					"type": "image_url",
+					"image_url": map[string]string{
 						"url": req.ImageURL,
 					},
 				},
@@ -86,18 +84,60 @@ func ProcessAIInfo(ctx context.Context, c *app.RequestContext) {
 		// 如果没有图片URL，则只添加文本内容
 		options = append(options, option.WithJSONSet("messages.1", map[string]interface{}{
 			"role":    "user",
-			"content": "你是一位专业的美食识别与能量分析专家，能够依据用户提供的食物图片，精准判断其中美食的名称，并详细给出该美食的能量组成。",
+			"content": "请提供一张食物图片，我将分析其中的食物并返回详细的营养信息",
 		}))
 	}
 
-	// 创建聊天完成请求
-	chatCompletion, err := client.Chat.Completions.New(context.Background(), params, options...)
+	chatCompletion, err := client.Chat.Completions.New(ctx, params, options...)
 	if err != nil {
+		hlog.Errorf("API调用失败: %v, 请求参数: %+v, 图片URL: %s", err, params, req.ImageURL)
 		c.String(consts.StatusInternalServerError, err.Error())
 		return
 	}
 
+	// 提取content内容
+	content := chatCompletion.Choices[0].Message.Content
+
+	// 去除Markdown格式的```json和```标记
+	jsonStr := content
+	hlog.Infof("content: %s", content)
+	if len(content) > 8 && content[:8] == "```json\n" {
+		if idx := strings.LastIndex(content, "\n```"); idx != -1 {
+			jsonStr = content[8:idx]
+		}
+	}
+
+	// 解析JSON结构
+	var jsonData map[string]interface{}
+	err = json.Unmarshal([]byte(jsonStr), &jsonData)
+	if err != nil {
+		hlog.Errorf("JSON解析失败: %v, JSON内容: %s", err, jsonStr)
+		c.String(consts.StatusInternalServerError, "JSON解析失败: "+err.Error())
+		return
+	}
+
+	// 提取properties部分作为食物信息
+	var foodData service.FoodInfo
+	if properties, ok := jsonData["properties"].(map[string]interface{}); ok {
+		foodData.Name, _ = properties["name"].(string)
+		foodData.Description, _ = properties["description"].(string)
+		foodData.Calories, _ = properties["calories"].(string)
+		foodData.Fat, _ = properties["fat"].(string)
+		foodData.Protein, _ = properties["protein"].(string)
+		foodData.Car, _ = properties["car"].(string)
+	} else {
+		// 尝试直接解析整个JSON
+		err = json.Unmarshal([]byte(jsonStr), &foodData)
+		if err != nil {
+			hlog.Errorf("食物信息解析失败: %v, JSON内容: %s", err, jsonStr)
+			c.String(consts.StatusInternalServerError, "食物信息解析失败: "+err.Error())
+			return
+		}
+	}
+
 	resp := new(service.AIInfoResponse)
-	resp.RespBody = chatCompletion.Choices[0].Message.Content
+	resp.Code = 0
+	resp.Data = &foodData
+	resp.Message = "success"
 	c.JSON(consts.StatusOK, resp)
 }
